@@ -1,363 +1,441 @@
 import {
 	App,
+	BaseComponent,
 	ButtonComponent,
-	Editor,
+	Component,
+	EventRef,
+	MarkdownView,
 	Modal,
 	Notice,
 	Plugin,
-	TextComponent,
-	ToggleComponent,
 	PluginSettingTab,
-	Setting
-} from 'obsidian';
+	Setting,
+	TextAreaComponent,
+	TextComponent,
+	TFile,
+	Vault,
+	Command,
+	Editor,
+	Hotkey,
+} from "obsidian";
 
-interface RfrPluginSettings {
-	findText: string;
-	replaceText: string;
-	useRegEx: boolean;
-	selOnly: boolean;
-	caseInsensitive: boolean;
-	processLineBreak: boolean;
-	processTab: boolean;
-	prefillFind: boolean;
-}
+export default class RegexPipeline extends Plugin {
+	rules: string[];
+	pathToRulesets = this.app.vault.configDir + "/regex-rulesets";
+	indexFile = "/index.txt";
+	menu: ApplyRuleSetMenu;
+	configs: SavedConfigs;
+	rightClickEventRef: EventRef;
+	quickCommands: Command[];
+	quickRulesChanged: boolean;
 
-const DEFAULT_SETTINGS: RfrPluginSettings = {
-	findText: '',
-	replaceText: '',
-	useRegEx: true,
-	selOnly: false,
-	caseInsensitive: false,
-	processLineBreak: false,
-	processTab: false,
-	prefillFind: false
-}
-
-// logThreshold: 0 ... only error messages
-//               9 ... verbose output
-const logThreshold = 9;
-const logger = (logString: string, logLevel=0): void => {if (logLevel <= logThreshold) console.log ('RegexFiRe: ' + logString)};
-
-export default class RegexFindReplacePlugin extends Plugin {
-	settings: RfrPluginSettings;
+	log(message?: any, ...optionalParams: any[]) {
+		// comment this to disable logging
+		console.log("[regex-pipeline] " + message);
+	}
 
 	async onload() {
-		logger('Loading Plugin...', 9);
-		await this.loadSettings();
+		this.log("loading");
+		this.addSettingTab(new ORPSettings(this.app, this));
+		this.configs = await this.loadData();
+		if (this.configs == null) this.configs = new SavedConfigs(3, 3, false);
+		if (this.configs.rulesInVault) this.pathToRulesets = "/regex-rulesets";
+		this.menu = new ApplyRuleSetMenu(this.app, this);
+		this.menu.contentEl.className = "rulesets-menu-content";
+		this.menu.titleEl.className = "rulesets-menu-title";
 
-		this.addSettingTab(new RegexFindReplaceSettingTab(this.app, this));
-
+		this.addRibbonIcon("dice", "Regex Rulesets", () => {
+			this.menu.open();
+		});
 
 		this.addCommand({
-			id: 'obsidian-regex-replace',
-			name: 'Find and Replace using regular expressions',
-			editorCallback: (editor) => {
-				new FindAndReplaceModal(this.app, editor, this.settings, this).open();
+			id: "apply-ruleset",
+			name: "Apply Ruleset",
+			// callback: () => {
+			// 	this.log('Simple Callback');
+			// },
+			checkCallback: (checking: boolean) => {
+				let leaf = this.app.workspace.activeLeaf;
+				if (leaf) {
+					if (!checking) {
+						this.menu.open();
+					}
+					return true;
+				}
+				return false;
 			},
 		});
+
+		this.reloadRulesets();
+		this.log("Rulesets: " + this.pathToRulesets);
+		this.log("Index: " + this.pathToRulesets + this.indexFile);
 	}
 
 	onunload() {
-		logger('Bye!', 9);
+		this.log("unloading");
+		if (this.rightClickEventRef != null)
+			this.app.workspace.offref(this.rightClickEventRef);
 	}
 
-	async loadSettings() {
-		logger('Loading Settings...', 6);
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-		logger('   findVal:         ' + this.settings.findText, 6);
-		logger('   replaceText:     ' + this.settings.replaceText, 6);
-		logger('   caseInsensitive: ' + this.settings.caseInsensitive, 6);
-		logger('   processLineBreak: ' + this.settings.processLineBreak, 6);
+	async reloadRulesets() {
+		if (!(await this.app.vault.adapter.exists(this.pathToRulesets)))
+			await this.app.vault.createFolder(this.pathToRulesets);
+		if (
+			!(await this.app.vault.adapter.exists(
+				this.pathToRulesets + this.indexFile
+			))
+		)
+			await this.app.vault.adapter
+				.write(this.pathToRulesets + this.indexFile, "")
+				.catch((r) => {
+					new Notice("Failed to write to index file: " + r);
+				});
 
+		let p = this.app.vault.adapter.read(
+			this.pathToRulesets + this.indexFile
+		);
+		p.then((s) => {
+			this.rules = s.split(/\r\n|\r|\n/);
+			this.rules = this.rules.filter((v) => v.length > 0);
+			this.log(this.rules);
+			this.updateRightclickMenu();
+			this.updateQuickCommands();
+		});
 	}
 
-	async saveSettings() {
-		await this.saveData(this.settings);
+	async updateQuickCommands() {
+		if (this.configs.quickCommands <= 0) return;
+		if (this.quickCommands == null)
+			this.quickCommands = new Array<Command>();
+		let expectedCommands = Math.min(
+			this.configs.quickCommands,
+			this.rules.length
+		);
+		// this.log(`setting up ${expectedCommands} commands...`)
+		for (let i = 0; i < expectedCommands; i++) {
+			let r = this.rules[i];
+			let c = this.addCommand({
+				id: `ruleset: ${r}`,
+				name: r,
+				editorCheckCallback: (checking: boolean) => {
+					if (checking) return this.rules.contains(r);
+					this.applyRuleset(this.pathToRulesets + "/" + r);
+				},
+			});
+			// this.log(`pusing ${r} command...`)
+			this.quickCommands.push(c);
+			this.log(this.quickCommands);
+		}
 	}
 
+	async updateRightclickMenu() {
+		if (this.rightClickEventRef != null)
+			this.app.workspace.offref(this.rightClickEventRef);
+		this.rightClickEventRef = this.app.workspace.on(
+			"editor-menu",
+			(menu) => {
+				for (
+					let i = 0;
+					i < Math.min(this.configs.quickRules, this.rules.length);
+					i++
+				) {
+					let rPath = this.pathToRulesets + "/" + this.rules[i];
+
+					menu.addItem((item) => {
+						item.setTitle(
+							"Regex Pipeline: " + this.rules[i]
+						).onClick(() => {
+							this.applyRuleset(rPath);
+						});
+					});
+				}
+			}
+		);
+		this.registerEvent(this.rightClickEventRef);
+	}
+
+	async appendRulesetsToIndex(name: string): Promise<boolean> {
+		var result: boolean = true;
+		this.rules.push(name);
+		var newIndexValue = "";
+		this.rules.forEach((v, i, all) => {
+			newIndexValue += v + "\n";
+		});
+		await this.app.vault.adapter
+			.write(this.pathToRulesets + this.indexFile, newIndexValue)
+			.catch((r) => {
+				new Notice("Failed to write to index file: " + r);
+				result = false;
+			});
+
+		return result;
+	}
+
+	async createRuleset(name: string, content: string): Promise<boolean> {
+		var result: boolean = true;
+		this.log("createRuleset: " + name);
+		var path = this.pathToRulesets + "/" + name;
+		if (await this.app.vault.adapter.exists(path)) {
+			this.log("file existed: " + path);
+			return false;
+		}
+
+		await this.app.vault.adapter.write(path, content).catch((r) => {
+			new Notice("Failed to write the ruleset file: " + r);
+			result = false;
+		});
+
+		result = await this.appendRulesetsToIndex(name);
+		return true;
+	}
+
+	async applyRuleset(ruleset: string) {
+		if (!(await this.app.vault.adapter.exists(ruleset))) {
+			new Notice(ruleset + " not found!");
+			return;
+		}
+		let ruleParser =
+			/^"(.+?)"([a-z]*?)(?:\r\n|\r|\n)?->(?:\r\n|\r|\n)?"(.*?)"([a-z]*?)(?:\r\n|\r|\n)?$/gmsu;
+		let ruleText = await this.app.vault.adapter.read(ruleset);
+
+		let activeMarkdownView =
+			this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (activeMarkdownView == null) {
+			new Notice("No active Markdown file!");
+			return;
+		}
+
+		let subject;
+		let selectionMode;
+		if (activeMarkdownView.editor.somethingSelected()) {
+			subject = activeMarkdownView.editor.getSelection();
+			selectionMode = true;
+		} else {
+			subject = activeMarkdownView.editor.getValue();
+		}
+
+		let pos = activeMarkdownView.editor.getScrollInfo();
+		this.log(pos.top);
+
+		let count = 0;
+		let ruleMatches;
+		while ((ruleMatches = ruleParser.exec(ruleText))) {
+			if (ruleMatches == null) break;
+			this.log("\n" + ruleMatches[1] + "\n↓↓↓↓↓\n" + ruleMatches[3]);
+
+			let matchRule =
+				ruleMatches[2].length == 0
+					? new RegExp(ruleMatches[1], "gm")
+					: new RegExp(ruleMatches[1], ruleMatches[2]);
+			if (ruleMatches[4] == "x") subject = subject.replace(matchRule, "");
+			else subject = subject.replace(matchRule, ruleMatches[3]);
+			count++;
+		}
+		if (selectionMode) activeMarkdownView.editor.replaceSelection(subject);
+		else activeMarkdownView.editor.setValue(subject);
+
+		activeMarkdownView.requestSave();
+		activeMarkdownView.editor.scrollTo(0, pos.top);
+		new Notice(
+			"Executed ruleset '" +
+				ruleset +
+				"' which contains " +
+				count +
+				" regex replacements!"
+		);
+	}
 }
 
-class FindAndReplaceModal extends Modal {
-	constructor(app: App, editor: Editor, settings: RfrPluginSettings, plugin: Plugin) {
-		super(app);
-		this.editor = editor;
-		this.settings = settings;
-		this.plugin = plugin;
+class SavedConfigs {
+	constructor(
+		quickRules: number,
+		quickCommands: number,
+		rulesInVault: boolean
+	) {
+		this.quickRules = quickRules;
+		this.rulesInVault = rulesInVault;
+		this.quickCommands = quickCommands;
+	}
+	quickRules: number;
+	quickCommands: number;
+	rulesInVault: boolean;
+}
+
+class ORPSettings extends PluginSettingTab {
+	plugin: RegexPipeline;
+	constructor(app: App, plugin: RegexPipeline) {
+		super(app, plugin);
 	}
 
-	settings: RfrPluginSettings;
-	editor: Editor;
-	plugin: Plugin;
+	quickRulesCache: number;
+
+	display() {
+		this.containerEl.empty();
+		new Setting(this.containerEl)
+			.setName("Quick Rules")
+			.setDesc(
+				"The first N rulesets in your index file will be available in the right click menu."
+			)
+			.addSlider((c) => {
+				c.setValue(this.plugin.configs.quickRules);
+				c.setLimits(0, 10, 1);
+				c.setDynamicTooltip();
+				c.showTooltip();
+				c.onChange((v) => {
+					if (v != this.plugin.configs.quickRules)
+						this.plugin.quickRulesChanged = true;
+					this.plugin.configs.quickRules = v;
+				});
+			});
+		new Setting(this.containerEl)
+			.setName("Quick Rule Commands")
+			.setDesc(
+				"The first N rulesets in your index file will be available as Obsidian commands. When changing this count or re-ordering rules, existing commands will not be removed until next reload (You can also manually re-enable the plugin)."
+			)
+			.addSlider((c) => {
+				c.setValue(this.plugin.configs.quickCommands);
+				c.setLimits(0, 10, 1);
+				c.setDynamicTooltip();
+				c.showTooltip();
+				c.onChange((v) => {
+					this.plugin.configs.quickCommands = v;
+					this.plugin.updateQuickCommands();
+				});
+			});
+		new Setting(this.containerEl)
+			.setName("Save Rules In Vault")
+			.setDesc(
+				'Reads rulesets from ".obsidian/regex-rulesets" when off, "./regex-ruleset" when on (useful if you are user of ObsidianSync). '
+			)
+			.addToggle((c) => {
+				c.setValue(this.plugin.configs.rulesInVault);
+				c.onChange((v) => {
+					this.plugin.configs.rulesInVault = v;
+					if (v) this.plugin.pathToRulesets = "/regex-rulesets";
+					else
+						this.plugin.pathToRulesets =
+							this.app.vault.configDir + "/regex-rulesets";
+				});
+			});
+	}
+
+	hide() {
+		this.plugin.reloadRulesets();
+		this.plugin.saveData(this.plugin.configs);
+	}
+}
+
+class ApplyRuleSetMenu extends Modal {
+	plugin: RegexPipeline;
+	constructor(app: App, plugin: RegexPipeline) {
+		super(app);
+		this.plugin = plugin;
+		this.modalEl.style.setProperty("width", "60vw");
+		this.modalEl.style.setProperty("max-height", "60vh");
+		this.modalEl.style.setProperty("padding", "2rem");
+		this.titleEl.createEl("h1",undefined, (el) => {
+			el.innerHTML = this.plugin.pathToRulesets + "/...";
+			el.style.setProperty("display", "inline-block");
+			el.style.setProperty("width", "92%");
+			el.style.setProperty("max-width", "480px");
+			el.style.setProperty("margin", "12 0 8");
+		});
+		this.titleEl.createEl("h1", undefined, (el) => {
+			el.style.setProperty("flex-grow", "1");
+		});
+		var reloadButton = new ButtonComponent(this.titleEl)
+			.setButtonText("RELOAD")
+			.onClick(async (evt) => {
+				await this.plugin.reloadRulesets();
+				this.onClose();
+				this.onOpen();
+			});
+		reloadButton.buttonEl.style.setProperty("display", "inline-block");
+		reloadButton.buttonEl.style.setProperty("bottom", "8px");
+		reloadButton.buttonEl.style.setProperty("margin", "auto");
+	}
 
 	onOpen() {
-		const { contentEl, titleEl, editor, modalEl } = this;
-
-		modalEl.addClass('find-replace-modal');
-		titleEl.setText('Regex Find/Replace');
-
-		const rowClass = 'row';
-		const divClass = 'div';
-		const noSelection = editor.getSelection() === '';
-		let regexFlags = 'gm';
-		if (this.settings.caseInsensitive) regexFlags = regexFlags.concat('i');
-
-		logger('No text selected?: ' + noSelection, 9);
-
-		const addTextComponent = (label: string, placeholder: string, postfix=''): [TextComponent, HTMLDivElement] => {
-			const containerEl = document.createElement(divClass);
-			containerEl.addClass(rowClass);
-
-			const targetEl = document.createElement(divClass);
-			targetEl.addClass('input-wrapper');
-
-			const labelEl = document.createElement(divClass);
-			labelEl.addClass('input-label');
-			labelEl.setText(label);
-
-			const labelEl2 = document.createElement(divClass);
-			labelEl2.addClass('postfix-label');
-			labelEl2.setText(postfix);
-
-			containerEl.appendChild(labelEl);
-			containerEl.appendChild(targetEl);
-			containerEl.appendChild(labelEl2);
-
-			const component = new TextComponent(targetEl);
-			component.setPlaceholder(placeholder);
-
-			contentEl.append(containerEl);
-			return [component, labelEl2];
-		};
-
-		const addToggleComponent = (label: string, tooltip: string, hide = false): ToggleComponent => {
-			const containerEl = document.createElement(divClass);
-			containerEl.addClass(rowClass);
-	
-			const targetEl = document.createElement(divClass);
-			targetEl.addClass(rowClass);
-
-			const component = new ToggleComponent(targetEl);
-			component.setTooltip(tooltip);
-	
-			const labelEl = document.createElement(divClass);
-			labelEl.addClass('check-label');
-			labelEl.setText(label);
-	
-			containerEl.appendChild(labelEl);
-			containerEl.appendChild(targetEl);
-			if (!hide) contentEl.appendChild(containerEl);
-			return component;
-		};
-
-		// Create input fields
-		const findRow = addTextComponent('Find:', 'e.g. (.*)', '/' + regexFlags);
-		const findInputComponent = findRow[0];
-		const findRegexFlags = findRow[1];
-		const replaceRow = addTextComponent('Replace:', 'e.g. $1', this.settings.processLineBreak ? '\\n=LF' : '');
-		const replaceWithInputComponent = replaceRow[0];
-
-		// Create and show regular expression toggle switch
-		const regToggleComponent = addToggleComponent('Use regular expressions', 'If enabled, regular expressions in the find field are processed as such, and regex groups might be addressed in the replace field');
-		
-		// Update regex-flags label if regular expressions are enabled or disabled
-		regToggleComponent.onChange( regNew => {
-			if (regNew) {
-				findRegexFlags.setText('/' + regexFlags);
-			}
-			else {
-				findRegexFlags.setText('');
-			}
-		})
-
-		// Create and show selection toggle switch only if any text is selected
-		const selToggleComponent = addToggleComponent('Replace only in selection', 'If enabled, replaces only occurances in the currently selected text', noSelection);
-
-		// Create Buttons
-		const buttonContainerEl = document.createElement(divClass);
-		buttonContainerEl.addClass(rowClass);
-
-		const submitButtonTarget = document.createElement(divClass);
-		submitButtonTarget.addClass('button-wrapper');
-		submitButtonTarget.addClass(rowClass);
-
-		const cancelButtonTarget = document.createElement(divClass);
-		cancelButtonTarget.addClass('button-wrapper');
-		cancelButtonTarget.addClass(rowClass);
-
-		const submitButtonComponent = new ButtonComponent(submitButtonTarget);
-		const cancelButtonComponent = new ButtonComponent(cancelButtonTarget);
-		
-		cancelButtonComponent.setButtonText('Cancel');
-		cancelButtonComponent.onClick(() => {
-			logger('Action cancelled.', 8);
-			this.close();
-		});
-
-		submitButtonComponent.setButtonText('Replace All');
-		submitButtonComponent.setCta();
-		submitButtonComponent.onClick(() => {
-			let resultString = 'No match';
-			let scope = '';
-			const searchString = findInputComponent.getValue();
-			let replaceString = replaceWithInputComponent.getValue();
-			const selectedText = editor.getSelection();
-
-			if (searchString === '') {
-				new Notice('Nothing to search for!');
-				return;
-			}
-
-			// Replace line breaks in find-field if option is enabled
-			if (this.settings.processLineBreak) {
-				logger('Replacing linebreaks in replace-field', 9);
-				logger('  old: ' + replaceString, 9);
-				replaceString = replaceString.replace(/\\n/gm, '\n');
-				logger('  new: ' + replaceString, 9);
-			}
-
-			// Replace line breaks in find-field if option is enabled
-			if (this.settings.processTab) {
-				logger('Replacing tabs in replace-field', 9);
-				logger('  old: ' + replaceString, 9);
-				replaceString = replaceString.replace(/\\t/gm, '\t');
-				logger('  new: ' + replaceString, 9);
-			}
-
-			// Check if regular expressions should be used
-			if(regToggleComponent.getValue()) {
-				logger('USING regex with flags: ' + regexFlags, 8);
-
-				const searchRegex = new RegExp(searchString, regexFlags);
-				if(!selToggleComponent.getValue()) {
-					logger('   SCOPE: Full document', 9);
-					const documentText = editor.getValue();
-					const rresult = documentText.match(searchRegex);
-					if (rresult) {
-						editor.setValue(documentText.replace(searchRegex, replaceString));
-						resultString = `Made ${rresult.length} replacement(s) in document`;			
-					}
-				}
-				else {
-					logger('   SCOPE: Selection', 9);
-					const rresult = selectedText.match(searchRegex);
-					if (rresult) {
-						editor.replaceSelection(selectedText.replace(searchRegex, replaceString));	
-						resultString = `Made ${rresult.length} replacement(s) in selection`;
-					}
-				}
-			}
-			else {
-				logger('NOT using regex', 8);
-				let nrOfHits = 0;
-				if(!selToggleComponent.getValue()) {
-					logger('   SCOPE: Full document', 9);
-					scope = 'selection'
-					const documentText = editor.getValue();
-					const documentSplit = documentText.split(searchString);
-					nrOfHits = documentSplit.length - 1;
-					editor.setValue(documentSplit.join(replaceString));
-				}
-				else {
-					logger('   SCOPE: Selection', 9);
-					scope = 'document';
-					const selectedSplit = selectedText.split(searchString);
-					nrOfHits = selectedSplit.length - 1;
-					editor.replaceSelection(selectedSplit.join(replaceString));
-				}
-				resultString = `Made ${nrOfHits} replacement(s) in ${scope}`;
-			} 		
-			
-			// Saving settings (find/replace text and toggle switch states)
-			this.settings.findText = searchString;
-			this.settings.replaceText = replaceString;
-			this.settings.useRegEx = regToggleComponent.getValue();
-			this.settings.selOnly = selToggleComponent.getValue();
-			this.plugin.saveData(this.settings);
-
-			this.close();
-			new Notice(resultString);					
-		});
-
-		// Apply settings
-		regToggleComponent.setValue(this.settings.useRegEx);
-		selToggleComponent.setValue(this.settings.selOnly);
-		replaceWithInputComponent.setValue(this.settings.replaceText);
-		
-		// Check if the prefill find option is enabled and the selection does not contain linebreaks
-		if (this.settings.prefillFind && editor.getSelection().indexOf('\n') < 0 && !noSelection) {
-			logger('Found selection without linebreaks and option is enabled -> fill',9);
-			findInputComponent.setValue(editor.getSelection());
-			selToggleComponent.setValue(false);
+		for (let i = 0; i < this.plugin.rules.length; i++) {
+			// new Setting(contentEl)
+			// 	.setName(this.plugin.rules[i])
+			// 	.addButton(btn => btn.onClick(async () => {
+			// 		this.plugin.applyRuleset(this.plugin.pathToRulesets + "/" + this.plugin.rules[i])
+			// 		this.close();
+			// 	}).setButtonText("Apply"));
+			var ruleset = new ButtonComponent(this.contentEl)
+				.setButtonText(this.plugin.rules[i])
+				.onClick(async (evt) => {
+					this.plugin.applyRuleset(
+						this.plugin.pathToRulesets + "/" + this.plugin.rules[i]
+					);
+					this.close();
+				});
+			ruleset.buttonEl.className = "apply-ruleset-button";
 		}
-		else {
-			logger('Restore find text', 9);
-			findInputComponent.setValue(this.settings.findText);
-		}
-		
-		// Add button row to dialog
-		buttonContainerEl.appendChild(submitButtonTarget);
-		buttonContainerEl.appendChild(cancelButtonTarget);
-		contentEl.appendChild(buttonContainerEl);
-
-		// If no text is selected, disable selection-toggle-switch
-		if (noSelection) selToggleComponent.setValue(false);
+		this.titleEl.getElementsByTagName("h1")[0].innerHTML =
+			this.plugin.pathToRulesets + "/...";
+		var addButton = new ButtonComponent(this.contentEl)
+			.setButtonText("+")
+			.onClick(async (evt) => {
+				new NewRulesetPanel(this.app, this.plugin).open();
+			});
+		addButton.buttonEl.className = "add-ruleset-button";
+		addButton.buttonEl.style.setProperty("width", "3.3em");
 	}
-	
+
 	onClose() {
-		const { contentEl } = this;
+		let { contentEl } = this;
 		contentEl.empty();
 	}
 }
 
-class RegexFindReplaceSettingTab extends PluginSettingTab {
-	plugin: RegexFindReplacePlugin;
-
-	constructor(app: App, plugin: RegexFindReplacePlugin) {
-		super(app, plugin);
+class NewRulesetPanel extends Modal {
+	plugin: RegexPipeline;
+	constructor(app: App, plugin: RegexPipeline) {
+		super(app);
 		this.plugin = plugin;
+		this.contentEl.className = "ruleset-creation-content";
 	}
 
-	display(): void {
-		const {containerEl} = this;
-		containerEl.empty();
+	onOpen() {
+		var nameHint = this.contentEl.createEl("h4");
+		nameHint.innerHTML = "Name";
+		this.contentEl.append(nameHint);
+		var nameInput = this.contentEl.createEl("textarea");
+		nameInput.setAttr("rows", "1");
+		nameInput.addEventListener("keydown", (e) => {
+			if (e.key === "Enter") e.preventDefault();
+		});
+		this.contentEl.append(nameInput);
+		var contentHint = this.contentEl.createEl("h4");
+		contentHint.innerHTML = "Content";
+		this.contentEl.append(contentHint);
+		var contentInput = this.contentEl.createEl("textarea");
+		contentInput.style.setProperty("height", "300px");
+		this.contentEl.append(contentInput);
+		var saveButton = new ButtonComponent(this.contentEl)
+			.setButtonText("Save")
+			.onClick(async (evt) => {
+				if (
+					!(await this.plugin.createRuleset(
+						nameInput.value,
+						contentInput.value
+					))
+				) {
+					new Notice(
+						"Failed to create the ruleset! Please check if the file already exist."
+					);
+					return;
+				}
+				this.plugin.menu.onClose();
+				this.plugin.menu.onOpen();
+				this.close();
+			});
+	}
 
-		containerEl.createEl('h4', {text: 'Regular Expression Settings'});
-
-		new Setting(containerEl)
-			.setName('Case Insensitive')
-			.setDesc('When using regular expressions, apply the \'/i\' modifier for case insensitive search)')
-			.addToggle(toggle => toggle
-				.setValue(this.plugin.settings.caseInsensitive)
-				.onChange(async (value) => {
-					logger('Settings update: caseInsensitive: ' + value);
-					this.plugin.settings.caseInsensitive = value;
-					await this.plugin.saveSettings();
-				}));
-
-		containerEl.createEl('h4', {text: 'General Settings'});
-
-
-		new Setting(containerEl)
-			.setName('Process \\n as line break')
-			.setDesc('When \'\\n\' is used in the replace field, a \'line break\' will be inserted accordingly')
-			.addToggle(toggle => toggle
-				.setValue(this.plugin.settings.processLineBreak)
-				.onChange(async (value) => {
-					logger('Settings update: processLineBreak: ' + value);
-					this.plugin.settings.processLineBreak = value;
-					await this.plugin.saveSettings();
-				}));
-
-
-		new Setting(containerEl)
-			.setName('Prefill Find Field')
-			.setDesc('Copy the currently selected text (if any) into the \'Find\' text field. This setting is only applied if the selection does not contain linebreaks')
-			.addToggle(toggle => toggle
-				.setValue(this.plugin.settings.prefillFind)
-				.onChange(async (value) => {
-					logger('Settings update: prefillFind: ' + value);
-					this.plugin.settings.prefillFind = value;
-					await this.plugin.saveSettings();
-				}));
+	onClose() {
+		let { contentEl } = this;
+		contentEl.empty();
 	}
 }
